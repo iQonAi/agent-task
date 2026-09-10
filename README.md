@@ -94,7 +94,9 @@ sudo systemctl enable --now agent-taskd
 ```
 
 See `docs/runbook/0001-agent-task-vm.md` for the full host setup (Podman, the
-egress deny-list, credential provisioning).
+egress deny-list, credential provisioning), and
+`docs/runbook/0002-add-a-repo.md` for the procedure to register a new repo
+(token, credential file, `LoadCredential`, config entry).
 
 ## Configuration
 
@@ -218,4 +220,5 @@ codebase is built against.
 - `TECHNICAL_DESIGN.md` — architecture, decisions, and milestones
 - `docs/project/` — vision, system architecture, and the security/threat model
 - `docs/runbook/0001-agent-task-vm.md` — operator runbook for provisioning a host
+- `docs/runbook/0002-add-a-repo.md` — how to add a repository and its credentials
 - `images/README.md` — agent base image contents and build/update process
