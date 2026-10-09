@@ -33,6 +33,9 @@ func AddRepo(path string, r Repo) error {
 	if reposNode.Kind != yaml.SequenceNode {
 		return fmt.Errorf("config %s: repos is not a sequence", path)
 	}
+	if reposNode.Style == yaml.FlowStyle {
+		return fmt.Errorf("config %s: repos: is flow-style YAML; this command only supports block-style lists -- edit config.yaml manually", path)
+	}
 	for _, item := range reposNode.Content {
 		if item.Kind == yaml.MappingNode && repoNameOf(item) == r.Name {
 			return fmt.Errorf("repo %q already exists in %s", r.Name, path)
@@ -47,6 +50,9 @@ func AddRepo(path string, r Repo) error {
 	insertAt := reposNode.Line // fallback: right after "repos:" (empty sequence)
 	if n := len(reposNode.Content); n > 0 {
 		last := reposNode.Content[n-1]
+		if hasMultilineValue(last) {
+			return fmt.Errorf("config %s: repo entry has a multi-line value; edit config.yaml manually instead of using this command", path)
+		}
 		insertAt = last.Content[len(last.Content)-1].Line
 	}
 
@@ -77,6 +83,9 @@ func RemoveRepo(path string, name string) (bool, error) {
 	if reposNode.Kind != yaml.SequenceNode {
 		return false, fmt.Errorf("config %s: repos is not a sequence", path)
 	}
+	if reposNode.Style == yaml.FlowStyle {
+		return false, fmt.Errorf("config %s: repos: is flow-style YAML; this command only supports block-style lists -- edit config.yaml manually", path)
+	}
 
 	var match *yaml.Node
 	for _, item := range reposNode.Content {
@@ -87,6 +96,9 @@ func RemoveRepo(path string, name string) (bool, error) {
 	}
 	if match == nil {
 		return false, nil
+	}
+	if hasMultilineValue(match) {
+		return false, fmt.Errorf("config %s: repo entry has a multi-line value; edit config.yaml manually instead of using this command", path)
 	}
 
 	start := match.Content[0].Line
@@ -110,6 +122,9 @@ func readConfig(path string) (raw string, root *yaml.Node, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	if strings.Contains(string(data), "\r\n") {
+		return "", nil, fmt.Errorf("config %s: CRLF line endings are not supported; convert to LF line endings", path)
 	}
 
 	var doc yaml.Node
@@ -153,6 +168,20 @@ func repoNameOf(mapping *yaml.Node) string {
 	return ""
 }
 
+// hasMultilineValue reports whether entry (a repo mapping node) has a field
+// value rendered as a literal (|) or folded (>) block scalar, which spans
+// more than one physical line. A value node's Line is the line of the block
+// indicator, not the scalar's last line, so splicing by Line would corrupt
+// such an entry.
+func hasMultilineValue(entry *yaml.Node) bool {
+	for i := 1; i < len(entry.Content); i += 2 {
+		if v := entry.Content[i]; v.Style == yaml.LiteralStyle || v.Style == yaml.FoldedStyle {
+			return true
+		}
+	}
+	return false
+}
+
 // repoEntryLines renders r as the lines of a `- name: ...` block sequence
 // item, in config.example.yaml's 2-space/4-space indent style.
 func repoEntryLines(r Repo) ([]string, error) {
@@ -165,6 +194,9 @@ func repoEntryLines(r Repo) ([]string, error) {
 	}
 	lines := make([]string, 0, len(fields))
 	for i, f := range fields {
+		if err := rejectControlChars(f.k, f.v); err != nil {
+			return nil, err
+		}
 		val, err := scalarize(f.v)
 		if err != nil {
 			return nil, err
@@ -176,6 +208,20 @@ func repoEntryLines(r Repo) ([]string, error) {
 		lines = append(lines, fmt.Sprintf("%s%s: %s", prefix, f.k, val))
 	}
 	return lines, nil
+}
+
+// rejectControlChars errors if v contains a newline or other control
+// character: repoEntryLines renders each field as a single physical line,
+// so such a value would either break the splice or (via a block scalar)
+// render across multiple lines that the single-line prefix logic can't
+// place correctly.
+func rejectControlChars(field, v string) error {
+	for _, r := range v {
+		if r < 0x20 {
+			return fmt.Errorf("%s: value contains a newline or control character, which is not supported", field)
+		}
+	}
+	return nil
 }
 
 // scalarize renders v the way yaml.v3 would render it as a plain mapping

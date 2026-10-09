@@ -188,3 +188,146 @@ func TestRemoveRepo_UnknownNameErrorsCleanly(t *testing.T) {
 		t.Fatalf("backup file was written despite removing an unknown name")
 	}
 }
+
+// TestAddRepo_RejectsEmbeddedNewline covers finding 1: a field value with an
+// embedded newline would otherwise render as a block scalar that the
+// single-line splice can't place correctly.
+func TestAddRepo_RejectsEmbeddedNewline(t *testing.T) {
+	path := writeFixture(t)
+
+	err := AddRepo(path, Repo{
+		Name: "devbox", Owner: "acme", Repo: "devbox",
+		DefaultBranch: "main", TokenRef: "gh-token\nEVIL: injected",
+	})
+	if err == nil {
+		t.Fatalf("expected an error for a token_ref containing a newline, got nil")
+	}
+
+	if got := readFile(t, path); got != fixtureConfig {
+		t.Fatalf("config file was modified despite the rejected add.\ngot:\n%s", got)
+	}
+	if _, err := os.Stat(path + ".bak"); err == nil {
+		t.Fatalf("backup file was written despite the rejected add")
+	}
+}
+
+// fixtureMultilineValue has a repo entry whose token_ref is a literal block
+// scalar, spanning more than the one physical line its value node's Line
+// field reports.
+const fixtureMultilineValue = `repos:
+  - name: other
+    owner: iQonAi
+    repo: other
+    default_branch: main
+    token_ref: gh-token-other
+  - name: agent-task
+    owner: iQonAi
+    repo: agent-task
+    default_branch: main
+    token_ref: |-
+      gh-token-agent-task
+`
+
+// TestAddRepo_RejectsMultilineValueInExistingEntry covers finding 2 for
+// AddRepo: splicing after an entry with a block-scalar value must be
+// rejected, not silently corrupted.
+func TestAddRepo_RejectsMultilineValueInExistingEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(fixtureMultilineValue), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	err := AddRepo(path, Repo{
+		Name: "devbox", Owner: "acme", Repo: "devbox",
+		DefaultBranch: "main", TokenRef: "gh-token-devbox",
+	})
+	if err == nil {
+		t.Fatalf("expected an error when the last repo entry has a multi-line value, got nil")
+	}
+
+	if got := readFile(t, path); got != fixtureMultilineValue {
+		t.Fatalf("config file was modified despite the rejected add.\ngot:\n%s", got)
+	}
+}
+
+// TestRemoveRepo_RejectsMultilineValueInExistingEntry covers finding 2 for
+// RemoveRepo: removing an entry with a block-scalar value must be rejected,
+// not silently leave orphaned lines behind.
+func TestRemoveRepo_RejectsMultilineValueInExistingEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(fixtureMultilineValue), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	_, err := RemoveRepo(path, "agent-task")
+	if err == nil {
+		t.Fatalf("expected an error when the matched repo entry has a multi-line value, got nil")
+	}
+
+	if got := readFile(t, path); got != fixtureMultilineValue {
+		t.Fatalf("config file was modified despite the rejected remove.\ngot:\n%s", got)
+	}
+}
+
+// fixtureFlowStyle has repos: written as a flow-style sequence.
+const fixtureFlowStyle = `repos: [{name: a, owner: o, repo: r, default_branch: main, token_ref: t}]
+`
+
+// TestAddRepo_RejectsFlowStyleRepos covers finding 3 for AddRepo.
+func TestAddRepo_RejectsFlowStyleRepos(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(fixtureFlowStyle), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	err := AddRepo(path, Repo{
+		Name: "devbox", Owner: "acme", Repo: "devbox",
+		DefaultBranch: "main", TokenRef: "gh-token-devbox",
+	})
+	if err == nil {
+		t.Fatalf("expected an error for a flow-style repos: sequence, got nil")
+	}
+
+	if got := readFile(t, path); got != fixtureFlowStyle {
+		t.Fatalf("config file was modified despite the rejected add.\ngot:\n%s", got)
+	}
+}
+
+// TestRemoveRepo_RejectsFlowStyleRepos covers finding 3 for RemoveRepo.
+func TestRemoveRepo_RejectsFlowStyleRepos(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(fixtureFlowStyle), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	_, err := RemoveRepo(path, "a")
+	if err == nil {
+		t.Fatalf("expected an error for a flow-style repos: sequence, got nil")
+	}
+
+	if got := readFile(t, path); got != fixtureFlowStyle {
+		t.Fatalf("config file was modified despite the rejected remove.\ngot:\n%s", got)
+	}
+}
+
+// TestAddRepo_RejectsCRLF covers finding 4: a CRLF file must be rejected
+// outright rather than spliced with mixed line endings.
+func TestAddRepo_RejectsCRLF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	crlf := strings.ReplaceAll(fixtureConfig, "\n", "\r\n")
+	if err := os.WriteFile(path, []byte(crlf), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	err := AddRepo(path, Repo{
+		Name: "devbox", Owner: "acme", Repo: "devbox",
+		DefaultBranch: "main", TokenRef: "gh-token-devbox",
+	})
+	if err == nil {
+		t.Fatalf("expected an error for a CRLF config file, got nil")
+	}
+
+	if got := readFile(t, path); got != crlf {
+		t.Fatalf("config file was modified despite the rejected add.\ngot:\n%s", got)
+	}
+}
