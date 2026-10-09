@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -273,6 +274,52 @@ func TestRunCredsSet_IdempotentSecondRun(t *testing.T) {
 	}
 }
 
+// TestRunCredsSet_EnforcesModeOnRewrite covers finding 2: os.WriteFile only
+// applies a mode when it creates a file, so a credential file that already
+// existed at a looser mode (e.g. from before this command existed) must be
+// brought back to 0600 explicitly, regardless of whether its content also
+// changed.
+func TestRunCredsSet_EnforcesModeOnRewrite(t *testing.T) {
+	credDir := t.TempDir()
+	unitPath := writeUnitFixture(t)
+	const secret = "same-secret\n"
+
+	if err := os.WriteFile(filepath.Join(credDir, "loose-mode-ref"), []byte("same-secret"), 0o644); err != nil {
+		t.Fatalf("pre-create credential at 0644: %v", err)
+	}
+
+	stdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	if _, err := w.WriteString(secret); err != nil {
+		t.Fatalf("write to stdin pipe: %v", err)
+	}
+	w.Close()
+	os.Stdin = r
+	defer func() { os.Stdin = stdin }()
+
+	withCapturedStdout(t, func() {
+		if err := runCredsSet([]string{
+			"--credentials-dir", credDir,
+			"--unit-file", unitPath,
+			"--socket", filepath.Join(t.TempDir(), "no-such.sock"),
+			"loose-mode-ref",
+		}); err != nil {
+			t.Fatalf("runCredsSet: %v", err)
+		}
+	})
+
+	info, err := os.Stat(filepath.Join(credDir, "loose-mode-ref"))
+	if err != nil {
+		t.Fatalf("stat credential: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("credential file mode = %o, want 0600 (pre-existing 0644 not corrected)", mode)
+	}
+}
+
 // fakeTaskLister is a stub taskLister for exercising the in-flight-task
 // check without a real daemon socket.
 type fakeTaskLister struct {
@@ -286,18 +333,20 @@ func (f fakeTaskLister) Tasks() ([]store.Task, error) {
 
 // TestInFlightTaskIDs covers the design note's safety check: non-terminal
 // tasks are reported as in flight, terminal ones are not, and a Tasks()
-// error (an unreachable daemon) is treated as "nothing running" rather than
-// propagated.
+// error is returned to the caller rather than swallowed -- it is
+// restartBlockReason's job, not this function's, to decide what an error
+// means.
 func TestInFlightTaskIDs(t *testing.T) {
 	cases := []struct {
-		name   string
-		client fakeTaskLister
-		want   []string
+		name    string
+		client  fakeTaskLister
+		want    []string
+		wantErr bool
 	}{
 		{
-			name:   "unreachable daemon has nothing running",
-			client: fakeTaskLister{err: fmt.Errorf("connect to daemon: socket error")},
-			want:   nil,
+			name:    "a Tasks() error is returned, not swallowed",
+			client:  fakeTaskLister{err: fmt.Errorf("decode /v1/tasks response: boom")},
+			wantErr: true,
 		},
 		{
 			name: "running and created tasks are in flight",
@@ -321,7 +370,13 @@ func TestInFlightTaskIDs(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := inFlightTaskIDs(tc.client)
+			got, err := inFlightTaskIDs(tc.client)
+			if tc.wantErr && err == nil {
+				t.Fatalf("inFlightTaskIDs() error = nil, want an error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("inFlightTaskIDs() error = %v, want nil", err)
+			}
 			if len(got) != len(tc.want) {
 				t.Fatalf("inFlightTaskIDs() = %v, want %v", got, tc.want)
 			}
@@ -334,26 +389,79 @@ func TestInFlightTaskIDs(t *testing.T) {
 	}
 }
 
-// TestRestartAllowed covers the --force gating: running tasks block a
-// restart unless --force is set; an unreachable daemon (no running tasks)
-// never blocks.
-func TestRestartAllowed(t *testing.T) {
+// fakeTimeoutErr mimics an http.Client timeout error: it implements
+// net.Error with Timeout() true, but is not a *net.OpError, so it must not
+// be mistaken for "the daemon isn't listening at all."
+type fakeTimeoutErr struct{}
+
+func (fakeTimeoutErr) Error() string   { return "context deadline exceeded" }
+func (fakeTimeoutErr) Timeout() bool   { return true }
+func (fakeTimeoutErr) Temporary() bool { return true }
+
+// TestDaemonUnreachable covers the critical distinction from finding 3: a
+// dial failure (connection refused / no such socket) means nothing is
+// listening, which is safe; a timeout or any other error does not, because
+// it can mean the daemon is up but hung.
+func TestDaemonUnreachable(t *testing.T) {
+	dialErr := &net.OpError{Op: "dial", Net: "unix", Err: fmt.Errorf("connection refused")}
+	readErr := &net.OpError{Op: "read", Net: "unix", Err: fmt.Errorf("broken pipe")}
+
 	cases := []struct {
-		name    string
-		running []string
-		force   bool
-		want    bool
+		name string
+		err  error
+		want bool
 	}{
-		{name: "no tasks running, no force", running: nil, force: false, want: true},
-		{name: "tasks running, no force: blocked", running: []string{"t1"}, force: false, want: false},
-		{name: "tasks running, force: allowed", running: []string{"t1"}, force: true, want: true},
+		{name: "dial failure is unreachable", err: dialErr, want: true},
+		{name: "dial failure wrapped by fmt.Errorf is still unreachable", err: fmt.Errorf("connect to daemon: %w", dialErr), want: true},
+		{name: "a non-dial OpError is not unreachable", err: readErr, want: false},
+		{name: "a timeout is not unreachable", err: fakeTimeoutErr{}, want: false},
+		{name: "a generic error is not unreachable", err: fmt.Errorf("decode response: boom"), want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := restartAllowed(tc.running, tc.force); got != tc.want {
-				t.Fatalf("restartAllowed(%v, %v) = %v, want %v", tc.running, tc.force, got, tc.want)
+			if got := daemonUnreachable(tc.err); got != tc.want {
+				t.Fatalf("daemonUnreachable(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRestartBlockReason covers the --force gating end to end: running
+// tasks block a restart unless --force is set; a daemon that isn't
+// listening at all never blocks; but an inconclusive check (e.g. a
+// timeout) blocks too, same as running tasks, per finding 3.
+func TestRestartBlockReason(t *testing.T) {
+	dialErr := &net.OpError{Op: "dial", Net: "unix", Err: fmt.Errorf("connection refused")}
+
+	cases := []struct {
+		name        string
+		running     []string
+		tasksErr    error
+		wantBlocked bool
+	}{
+		{name: "nothing running, no error: proceed", running: nil, tasksErr: nil, wantBlocked: false},
+		{name: "tasks running: blocked", running: []string{"t1"}, tasksErr: nil, wantBlocked: true},
+		{name: "daemon not listening at all: proceed", running: nil, tasksErr: dialErr, wantBlocked: false},
+		{name: "inconclusive error (e.g. timeout): blocked", running: nil, tasksErr: fakeTimeoutErr{}, wantBlocked: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := restartBlockReason(tc.running, tc.tasksErr)
+			if blocked := reason != ""; blocked != tc.wantBlocked {
+				t.Fatalf("restartBlockReason(%v, %v) = %q (blocked=%v), want blocked=%v",
+					tc.running, tc.tasksErr, reason, blocked, tc.wantBlocked)
+			}
+		})
+	}
+}
+
+// TestDefaultUnitPath guards against finding 1's regression: this command
+// must edit the unit file systemd actually loads, not the repo's versioned
+// reference copy at deploy/systemd/agent-taskd.service.
+func TestDefaultUnitPath(t *testing.T) {
+	const want = "/etc/systemd/system/agent-taskd.service"
+	if defaultUnitPath != want {
+		t.Fatalf("defaultUnitPath = %q, want %q (the installed unit, not the repo's reference copy)", defaultUnitPath, want)
 	}
 }
 

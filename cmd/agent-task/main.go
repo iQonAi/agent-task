@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -39,10 +41,11 @@ const defaultConfigPath = "/etc/agent-task/config.yaml"
 // runtime CREDENTIALS_DIRECTORY once the unit is (re)started.
 const defaultCredentialsDir = "/etc/agent-task/credentials"
 
-// defaultUnitPath is the repo's reference systemd unit (deploy/systemd/
-// agent-taskd.service), the source of truth per the runbook; an operator
-// installs a copy at /etc/systemd/system/.
-const defaultUnitPath = "deploy/systemd/agent-taskd.service"
+// defaultUnitPath is the installed systemd unit that systemd actually loads
+// (README.md, docs/runbook/0001-agent-task-vm.md): the operator copies
+// deploy/systemd/agent-taskd.service here on install/upgrade. This command
+// edits the installed copy, never the repo's versioned reference copy.
+const defaultUnitPath = "/etc/systemd/system/agent-taskd.service"
 
 func main() {
 	// os.Args[0] is the porgram name; os.args[1] is the subcommand (if any).
@@ -75,6 +78,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	if errors.Is(err, errRestartSkipped) {
+		// The credential write already succeeded; this isn't a failure, but
+		// a script needs a non-zero, non-1 signal that the restart didn't
+		// happen, distinct from exit 1 (a real failure).
+		os.Exit(2)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-task: %v\n", err)
 		os.Exit(1)
@@ -665,7 +674,7 @@ func runCredsSet(args []string) error {
 		return nil
 	}
 
-	return maybeRestart(*socket, *force)
+	return maybeRestart(*socket, unitChanged, *force)
 }
 
 // trimTrailingNewline strips a single trailing newline (and, if CRLF, the
@@ -681,21 +690,27 @@ func trimTrailingNewline(data []byte) []byte {
 	return data
 }
 
-// writeCredentialFile writes data to path at mode 0600, reporting whether
-// the content changed (false if an identical file already existed there).
-// The caller uses this to decide whether a daemon restart is needed.
+// writeCredentialFile writes data to path, reporting whether the content
+// changed (false if an identical file already existed there). The caller
+// uses this to decide whether a daemon restart is needed. The file ends up
+// at mode 0600 either way: os.WriteFile only applies a mode when it creates
+// the file, so an existing file with a looser mode (e.g. from before this
+// command existed) needs an explicit chmod to be brought back into line.
 func writeCredentialFile(path string, data []byte) (changed bool, err error) {
 	existing, err := os.ReadFile(path)
-	if err == nil && bytes.Equal(existing, data) {
-		return false, nil
-	}
+	same := err == nil && bytes.Equal(existing, data)
 	if err != nil && !os.IsNotExist(err) {
 		return false, fmt.Errorf("read existing credential at %s: %w", path, err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return false, fmt.Errorf("write credential to %s: %w", path, err)
+	if !same {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return false, fmt.Errorf("write credential to %s: %w", path, err)
+		}
 	}
-	return true, nil
+	if err := os.Chmod(path, 0o600); err != nil {
+		return false, fmt.Errorf("chmod credential at %s: %w", path, err)
+	}
+	return !same, nil
 }
 
 // taskLister is the subset of *client.Client that the in-flight check needs;
@@ -705,14 +720,14 @@ type taskLister interface {
 }
 
 // inFlightTaskIDs returns the IDs of non-terminal (Created or Running)
-// tasks. Per issue #57's design note: if the daemon isn't reachable at all,
-// there is nothing running and a restart is safe, so a Tasks error is not
-// propagated as a command failure here -- it is treated the same as "no
-// tasks running."
-func inFlightTaskIDs(c taskLister) []string {
+// tasks, plus the raw error from Tasks() (nil on success). It does not
+// decide what an error means -- restartBlockReason does that, since
+// "daemon not listening at all" and "daemon up but not responding" call for
+// different handling.
+func inFlightTaskIDs(c taskLister) ([]string, error) {
 	tasks, err := c.Tasks()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var ids []string
 	for _, t := range tasks {
@@ -720,32 +735,75 @@ func inFlightTaskIDs(c taskLister) []string {
 			ids = append(ids, t.ID)
 		}
 	}
-	return ids
+	return ids, nil
 }
 
-// restartAllowed reports whether the self-service restart may proceed:
-// always if force is set, otherwise only if no tasks are in flight.
-func restartAllowed(running []string, force bool) bool {
-	return force || len(running) == 0
+// daemonUnreachable reports whether err indicates nothing is listening on
+// the daemon socket at all: a dial failure (connection refused, or the
+// socket path doesn't exist -- both surface as a *net.OpError with
+// Op "dial"). Per issue #57's design note, that case has nothing running,
+// so a restart is safe. Any other error -- including a timeout, which can
+// mean the daemon accepted the connection but is hung -- is not treated as
+// safe.
+func daemonUnreachable(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
+
+// restartBlockReason returns why the self-service restart must not proceed
+// without --force, or "" if it may proceed. tasksErr is the error (if any)
+// from listing the daemon's tasks.
+func restartBlockReason(running []string, tasksErr error) string {
+	switch {
+	case tasksErr != nil && daemonUnreachable(tasksErr):
+		return "" // nothing listening at all: nothing running, safe
+	case tasksErr != nil:
+		return fmt.Sprintf("could not confirm the daemon has no in-flight tasks: %v", tasksErr)
+	case len(running) > 0:
+		return fmt.Sprintf("%d task(s) still running (%s)", len(running), strings.Join(running, ", "))
+	default:
+		return ""
+	}
+}
+
+// errRestartSkipped signals that creds set wrote the credential
+// successfully but declined to restart the daemon -- in-flight tasks, or an
+// inconclusive in-flight check, blocked it without --force. The credential
+// write is not a failure, so main() maps this to its own exit code rather
+// than the generic failure exit code.
+var errRestartSkipped = errors.New("restart skipped (see the message above); rerun with --force or restart manually")
 
 // maybeRestart implements the self-service restart from issue #57's design
 // note: it runs `systemctl restart agent-taskd` itself, as the operator's
 // own action, rather than only printing a reminder. It checks the daemon's
-// own task list first so it doesn't kill an in-flight task; if any are
-// running, it warns and requires --force. UX choice: when nothing is running
-// it just restarts and informs the operator, with no extra confirmation
-// prompt -- running `creds set` is already the operator's own explicit
-// action. If systemctl itself fails (no systemd, or no permission -- expected
-// in dev/test environments), it falls back to printing the manual-restart
-// reminder instead of erroring the command out: the credential write already
-// succeeded, which is the important part.
-func maybeRestart(socketPath string, force bool) error {
-	running := inFlightTaskIDs(client.New(socketPath))
-	if !restartAllowed(running, force) {
-		fmt.Printf("%d task(s) still running (%s); not restarting\n", len(running), strings.Join(running, ", "))
+// own task list first so it doesn't kill an in-flight task; if the check is
+// blocked or inconclusive, it warns and requires --force. UX choice: when
+// nothing is running it just restarts and informs the operator, with no
+// extra confirmation prompt -- running `creds set` is already the
+// operator's own explicit action. unitChanged controls whether it reloads
+// the unit first: `systemctl restart` alone does not reparse a unit file
+// that changed on disk, but a daemon-reload on every run (including a
+// no-op) would be unnecessary. If systemctl itself fails (no systemd, or no
+// permission -- expected in dev/test environments), it falls back to
+// printing the manual-restart reminder instead of erroring the command out:
+// the credential write already succeeded, which is the important part.
+func maybeRestart(socketPath string, unitChanged, force bool) error {
+	running, tasksErr := inFlightTaskIDs(client.New(socketPath))
+	if reason := restartBlockReason(running, tasksErr); reason != "" && !force {
+		fmt.Printf("%s; not restarting\n", reason)
 		fmt.Println("rerun with --force to restart anyway, or restart manually later: sudo systemctl restart agent-taskd")
-		return nil
+		return errRestartSkipped
+	}
+
+	if unitChanged {
+		if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+			fmt.Println("could not reload the systemd unit automatically; reload and restart manually for this change to take effect:")
+			fmt.Println("  sudo systemctl daemon-reload && sudo systemctl restart agent-taskd")
+			if msg := strings.TrimSpace(string(out)); msg != "" {
+				fmt.Printf("(systemctl said: %s)\n", msg)
+			}
+			return nil
+		}
 	}
 
 	if out, err := exec.Command("systemctl", "restart", "agent-taskd").CombinedOutput(); err != nil {
