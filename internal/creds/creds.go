@@ -13,6 +13,18 @@ import (
 	"strings"
 )
 
+// ValidateRef checks that ref is safe to use as a bare file name within a
+// credentials directory. ref comes from config.yaml or an operator-typed CLI
+// argument, so it is operator-controlled rather than hostile -- but it names
+// a file, and a name containing a separator would reach outside the
+// credentials directory. Refuse rather than resolve.
+func ValidateRef(ref string) error {
+	if ref == "" || strings.ContainsAny(ref, `/\`) || ref == ".." {
+		return fmt.Errorf("invalid credentials ref %q: must be a bare file name", ref)
+	}
+	return nil
+}
+
 // Get returns the credential name ref. The boolean reports whether one was
 // found; a missing credeintal is not an error, because a public repo needs no
 // token and the daemon also runs outside systemd during development.
@@ -22,11 +34,8 @@ func Get(ref string) (string, bool, error) {
 		return "", false, nil // not running under systemd
 	}
 
-	// ref comes from config.yaml, so it is operator-controlled rather than
-	// hostile m-- but it names a file, and a name containing a separator would
-	// reach outside the credentials directory, Refuse rather than resolve
-	if ref == "" || strings.ContainsAny(ref, `/\`) || ref == ".." {
-		return "", false, fmt.Errorf("invalid credentials ref %q: must be a bare file name", ref)
+	if err := ValidateRef(ref); err != nil {
+		return "", false, err
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, ref))

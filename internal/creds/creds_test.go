@@ -76,3 +76,33 @@ func TestRefCannotEscapeDirectory(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateRef covers the ref-validation helper shared by Get and
+// `creds set`: valid bare file names, and the invalid forms that must be
+// rejected (empty, separators, parent-directory escape).
+func TestValidateRef(t *testing.T) {
+	cases := []struct {
+		ref     string
+		wantErr bool
+	}{
+		{ref: "gh-token-agent-task", wantErr: false},
+		{ref: "claude-oauth-token", wantErr: false},
+		{ref: "", wantErr: true},
+		{ref: "..", wantErr: true},
+		{ref: "../etc/passwd", wantErr: true},
+		{ref: "sub/token", wantErr: true},
+		{ref: `sub\token`, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.ref, func(t *testing.T) {
+			err := ValidateRef(tc.ref)
+			if tc.wantErr && err == nil {
+				t.Fatalf("ValidateRef(%q) = nil, want error", tc.ref)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("ValidateRef(%q) = %v, want nil", tc.ref, err)
+			}
+		})
+	}
+}
