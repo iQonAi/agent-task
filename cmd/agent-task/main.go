@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -66,13 +69,28 @@ func usage() {
 
 usage:
 	agent-task serve [--config PATH]	start the daemon (Unix socket)
-	agent-task repos [--socket PATH]	list registered repositories
+	agent-task repos [list] [--socket PATH]	list registered repositories
+	agent-task repos add (--url URL | --owner O --repo R) --name NAME [--default-branch B] [--token-ref REF] [--dry-run]	register a repo in config.yaml
+	agent-task repos remove NAME [--yes]	remove a repo from config.yaml
 	agent-task ls [--socket PATH]	list tasks
 	agent-task run --task TEXT --repo-url URL [--agent claude]	run an agent task locally (M3)
 	agent-task submit --repo NAME --agent NAME (--task TEXT | --issue N)	queue a task on the daemon
 	agent-task cancel ID [--socket PATH]	cancel a running task
 	agent-task status ID [--socket PATH]	show a task's state + events
 `)
+}
+
+// githubRefRE matches a GitHub repo URL in https:// or git@ (SSH) form, for
+// `repos add --url`.
+var githubRefRE = regexp.MustCompile(`^(?:https://github\.com/|git@github\.com:)([^/]+)/([^/]+?)(\.git)?/?$`)
+
+// parseGitHubRef parses a GitHub repo URL into its owner and repo name.
+func parseGitHubRef(s string) (owner, repo string, err error) {
+	m := githubRefRE.FindStringSubmatch(s)
+	if m == nil {
+		return "", "", fmt.Errorf("not a recognized GitHub URL: %q", s)
+	}
+	return m[1], m[2], nil
 }
 
 // runSubmit queues a task on the daemon over the socket.
@@ -381,8 +399,32 @@ func runServe(args []string) error {
 	return daemon.Run(ctx, cfg)
 }
 
+// runRepos dispatches to the repos subcommands. Bare `repos` (no args, or a
+// flag meant for list) stays an alias for `repos list`, matching the
+// pre-subcommand behavior exactly.
 func runRepos(args []string) error {
-	fs := flag.NewFlagSet("repos", flag.ExitOnError)
+	if len(args) == 0 {
+		return runReposList(args)
+	}
+	switch args[0] {
+	case "list":
+		return runReposList(args[1:])
+	case "add":
+		return runReposAdd(args[1:])
+	case "remove":
+		return runReposRemove(args[1:])
+	default:
+		if strings.HasPrefix(args[0], "-") {
+			return runReposList(args)
+		}
+		return fmt.Errorf("unknown repos subcommand %q (want list|add|remove)", args[0])
+	}
+}
+
+// runReposList lists registered repositories, read from the daemon over the
+// socket.
+func runReposList(args []string) error {
+	fs := flag.NewFlagSet("repos list", flag.ExitOnError)
 	socket := fs.String("socket", config.DefaultSocketPath, "daemon socket path")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -402,6 +444,130 @@ func runRepos(args []string) error {
 			r.Name, r.Owner, r.Repo, r.DefaultBranch, r.TokenRef)
 	}
 	return tw.Flush()
+}
+
+// runReposAdd registers a new repo in config.yaml. This is a one-shot CLI
+// edit, not a daemon RPC (ADR 0014 amendment): the daemon only seeds the
+// registry at startup, so a restart is needed for the change to take effect.
+func runReposAdd(args []string) error {
+	fs := flag.NewFlagSet("repos add", flag.ExitOnError)
+	configPath := fs.String("config", defaultConfigPath, "path to config.yaml")
+	url := fs.String("url", "", "GitHub repo URL (https:// or git@), an alternative to --owner/--repo")
+	owner := fs.String("owner", "", "GitHub repo owner")
+	repoName := fs.String("repo", "", "GitHub repo name")
+	name := fs.String("name", "", "short name for this repo in the registry (required)")
+	defaultBranch := fs.String("default-branch", "main", "default branch")
+	tokenRef := fs.String("token-ref", "", "LoadCredential secret name (default: gh-token-<name>)")
+	dryRun := fs.Bool("dry-run", false, "validate and print the change without writing config.yaml")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *name == "" {
+		return fmt.Errorf("--name is required")
+	}
+
+	o, r := *owner, *repoName
+	if *url != "" {
+		if o != "" || r != "" {
+			return fmt.Errorf("--url and --owner/--repo are mutually exclusive")
+		}
+		var err error
+		o, r, err = parseGitHubRef(*url)
+		if err != nil {
+			return err
+		}
+	}
+	if o == "" || r == "" {
+		return fmt.Errorf("one of --url or --owner/--repo is required")
+	}
+
+	ref := *tokenRef
+	if ref == "" {
+		ref = "gh-token-" + *name
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	for _, existing := range cfg.Repos {
+		if existing.Name == *name {
+			return fmt.Errorf("repo %q already exists in %s", *name, *configPath)
+		}
+	}
+
+	entry := config.Repo{
+		Name:          *name,
+		Owner:         o,
+		Repo:          r,
+		DefaultBranch: *defaultBranch,
+		TokenRef:      ref,
+	}
+
+	if *dryRun {
+		fmt.Printf("dry-run: would add repo %q (%s/%s, branch=%s, token_ref=%s) to %s\n",
+			entry.Name, entry.Owner, entry.Repo, entry.DefaultBranch, entry.TokenRef, *configPath)
+		return nil
+	}
+
+	if err := config.AddRepo(*configPath, entry); err != nil {
+		return err
+	}
+	fmt.Printf("added repo %q to %s (backup at %s.bak)\n", entry.Name, *configPath, *configPath)
+	fmt.Println("restart the daemon for this change to take effect")
+	return nil
+}
+
+// runReposRemove removes a repo from config.yaml. It does not touch
+// credential files or the systemd unit, and the daemon needs a restart to
+// pick up the change (ADR 0014 amendment).
+func runReposRemove(args []string) error {
+	fs := flag.NewFlagSet("repos remove", flag.ExitOnError)
+	configPath := fs.String("config", defaultConfigPath, "path to config.yaml")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: agent-task repos remove <name>")
+	}
+	name := fs.Arg(0)
+
+	if !*yes {
+		ok, err := confirm(fmt.Sprintf("remove repo %q from %s? [y/N] ", name, *configPath))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println("aborted")
+			return nil
+		}
+	}
+
+	found, err := config.RemoveRepo(*configPath, name)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("repo %q not found in %s", name, *configPath)
+	}
+
+	fmt.Printf("removed repo %q from %s (backup at %s.bak)\n", name, *configPath, *configPath)
+	fmt.Println("this does not touch credential files or the systemd unit")
+	fmt.Println("restart the daemon for this change to take effect")
+	return nil
+}
+
+// confirm prompts the user on stdin for a y/n answer.
+func confirm(prompt string) (bool, error) {
+	fmt.Print(prompt)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	line = strings.ToLower(strings.TrimSpace(line))
+	return line == "y" || line == "yes", nil
 }
 
 func runLs(args []string) error {
