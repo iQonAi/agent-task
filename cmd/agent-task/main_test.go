@@ -801,3 +801,57 @@ func TestRunReposDoctor_ExitNonZeroWhenAnyRepoFails(t *testing.T) {
 		t.Fatalf("output has no FAIL line:\n%s", out)
 	}
 }
+
+// doctorGhStub is a fake `gh` binary installed on PATH for
+// TestRunReposDoctor_ExitZeroWhenAllPass, exiting with $STUB_EXIT (0 =
+// success) -- the same mechanics as internal/github/github_test.go's
+// ghStub/TestCheckAccess, reused here so the full CLI path (which
+// constructs a real github.Client) never makes a real network call.
+const doctorGhStub = `#!/bin/sh
+exit "${STUB_EXIT:-0}"
+`
+
+// TestRunReposDoctor_ExitZeroWhenAllPass covers the full CLI path's
+// exit-code-0 behavior end to end: a repo whose credential file exists,
+// whose unit has the LoadCredential line, and whose `gh api` call succeeds
+// (via the stub) must make runReposDoctor return nil.
+func TestRunReposDoctor_ExitZeroWhenAllPass(t *testing.T) {
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(doctorGhStub), 0o755); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("STUB_EXIT", "0")
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	const content = "repos:\n  - {name: a, owner: o, repo: r, token_ref: gh-token-a}\n"
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	credentialsDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(credentialsDir, "gh-token-a"), []byte("tok\n"), 0o600); err != nil {
+		t.Fatalf("write credential fixture: %v", err)
+	}
+
+	unitPath := filepath.Join(t.TempDir(), "agent-taskd.service")
+	const unitContent = "LoadCredential=gh-token-a:/etc/agent-task/credentials/gh-token-a\n"
+	if err := os.WriteFile(unitPath, []byte(unitContent), 0o644); err != nil {
+		t.Fatalf("write unit file: %v", err)
+	}
+
+	var err error
+	out := withCapturedStdout(t, func() {
+		err = runReposDoctor([]string{
+			"--config", configPath,
+			"--credentials-dir", credentialsDir,
+			"--unit-file", unitPath,
+		})
+	})
+	if err != nil {
+		t.Fatalf("runReposDoctor() = %v, want nil:\n%s", err, out)
+	}
+	if strings.Contains(out, "FAIL") {
+		t.Fatalf("output has a FAIL line despite all checks passing:\n%s", out)
+	}
+}
