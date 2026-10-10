@@ -2,15 +2,20 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -20,14 +25,27 @@ import (
 	"github.com/iQonAi/agent-task/internal/client"
 	"github.com/iQonAi/agent-task/internal/config"
 	"github.com/iQonAi/agent-task/internal/controller"
+	"github.com/iQonAi/agent-task/internal/creds"
 	"github.com/iQonAi/agent-task/internal/daemon"
 	"github.com/iQonAi/agent-task/internal/prompt"
 	"github.com/iQonAi/agent-task/internal/repo"
 	"github.com/iQonAi/agent-task/internal/runner"
 	"github.com/iQonAi/agent-task/internal/store"
+	"github.com/iQonAi/agent-task/internal/unitfile"
 )
 
 const defaultConfigPath = "/etc/agent-task/config.yaml"
+
+// defaultCredentialsDir is the host-side source directory for systemd
+// LoadCredential (D3): a file here becomes available inside the daemon's
+// runtime CREDENTIALS_DIRECTORY once the unit is (re)started.
+const defaultCredentialsDir = "/etc/agent-task/credentials"
+
+// defaultUnitPath is the installed systemd unit that systemd actually loads
+// (README.md, docs/runbook/0001-agent-task-vm.md): the operator copies
+// deploy/systemd/agent-taskd.service here on install/upgrade. This command
+// edits the installed copy, never the repo's versioned reference copy.
+const defaultUnitPath = "/etc/systemd/system/agent-taskd.service"
 
 func main() {
 	// os.Args[0] is the porgram name; os.args[1] is the subcommand (if any).
@@ -42,6 +60,8 @@ func main() {
 		err = runServe(os.Args[2:])
 	case "repos":
 		err = runRepos(os.Args[2:])
+	case "creds":
+		err = runCreds(os.Args[2:])
 	case "ls":
 		err = runLs(os.Args[2:])
 	case "run":
@@ -58,6 +78,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	if errors.Is(err, errRestartSkipped) {
+		// The credential write already succeeded; this isn't a failure, but
+		// a script needs a non-zero, non-1 signal that the restart didn't
+		// happen, distinct from exit 1 (a real failure).
+		os.Exit(2)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent-task: %v\n", err)
 		os.Exit(1)
@@ -72,6 +98,8 @@ usage:
 	agent-task repos [list] [--socket PATH]	list registered repositories
 	agent-task repos add (--url URL | --owner O --repo R) --name NAME [--default-branch B] [--token-ref REF] [--dry-run]	register a repo in config.yaml
 	agent-task repos remove NAME [--yes]	remove a repo from config.yaml
+	agent-task creds set REF [--from-file PATH] [--force]	write a credential and wire it into the systemd unit
+	agent-task creds list [--config PATH]	show configured credential refs and their status
 	agent-task ls [--socket PATH]	list tasks
 	agent-task run --task TEXT --repo-url URL [--agent claude]	run an agent task locally (M3)
 	agent-task submit --repo NAME --agent NAME (--task TEXT | --issue N)	queue a task on the daemon
@@ -568,6 +596,303 @@ func confirm(prompt string) (bool, error) {
 	}
 	line = strings.ToLower(strings.TrimSpace(line))
 	return line == "y" || line == "yes", nil
+}
+
+// runCreds dispatches to the creds subcommands.
+func runCreds(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: agent-task creds set <ref> | agent-task creds list")
+	}
+	switch args[0] {
+	case "set":
+		return runCredsSet(args[1:])
+	case "list":
+		return runCredsList(args[1:])
+	default:
+		return fmt.Errorf("unknown creds subcommand %q (want set|list)", args[0])
+	}
+}
+
+// runCredsSet writes a secret to the credentials directory and wires it into
+// the systemd unit's LoadCredential lines. The secret is read from stdin (the
+// default) or --from-file; there is no flag or positional argument for the
+// value itself, so it is never visible in the shell history or process list.
+func runCredsSet(args []string) error {
+	fs := flag.NewFlagSet("creds set", flag.ExitOnError)
+	fromFile := fs.String("from-file", "", "read the secret from this file instead of stdin")
+	credentialsDir := fs.String("credentials-dir", defaultCredentialsDir, "directory to write the credential file into")
+	unitPath := fs.String("unit-file", defaultUnitPath, "systemd unit file to add the LoadCredential line to")
+	socket := fs.String("socket", config.DefaultSocketPath, "daemon socket path (for the in-flight task check)")
+	force := fs.Bool("force", false, "restart the daemon even if tasks are running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: agent-task creds set <ref> [--from-file PATH]")
+	}
+	ref := fs.Arg(0)
+	if err := creds.ValidateRef(ref); err != nil {
+		return err
+	}
+
+	var src io.Reader = os.Stdin
+	if *fromFile != "" {
+		f, err := os.Open(*fromFile)
+		if err != nil {
+			return fmt.Errorf("open --from-file: %w", err)
+		}
+		defer f.Close()
+		src = f
+	}
+	data, err := io.ReadAll(src)
+	if err != nil {
+		return fmt.Errorf("read secret: %w", err)
+	}
+	data = trimTrailingNewline(data)
+	if len(data) == 0 {
+		return fmt.Errorf("secret is empty")
+	}
+
+	credPath := filepath.Join(*credentialsDir, ref)
+	fileChanged, err := writeCredentialFile(credPath, data)
+	if err != nil {
+		return err
+	}
+
+	unitChanged, err := unitfile.EnsureLoadCredential(*unitPath, ref, credPath)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("wrote credential %q to %s\n", ref, credPath)
+	if unitChanged {
+		fmt.Printf("added LoadCredential line for %q to %s\n", ref, *unitPath)
+	}
+
+	if !fileChanged && !unitChanged {
+		fmt.Println("no change: credential and unit were already up to date")
+		return nil
+	}
+
+	return maybeRestart(*socket, unitChanged, *force)
+}
+
+// trimTrailingNewline strips a single trailing newline (and, if CRLF, the
+// preceding carriage return) the way creds.Get trims what it reads back, but
+// otherwise returns data unchanged.
+func trimTrailingNewline(data []byte) []byte {
+	if n := len(data); n > 0 && data[n-1] == '\n' {
+		data = data[:n-1]
+		if n := len(data); n > 0 && data[n-1] == '\r' {
+			data = data[:n-1]
+		}
+	}
+	return data
+}
+
+// writeCredentialFile writes data to path, reporting whether the content
+// changed (false if an identical file already existed there). The caller
+// uses this to decide whether a daemon restart is needed. The file ends up
+// at mode 0600 either way: os.WriteFile only applies a mode when it creates
+// the file, so an existing file with a looser mode (e.g. from before this
+// command existed) needs an explicit chmod to be brought back into line.
+func writeCredentialFile(path string, data []byte) (changed bool, err error) {
+	existing, err := os.ReadFile(path)
+	same := err == nil && bytes.Equal(existing, data)
+	if err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("read existing credential at %s: %w", path, err)
+	}
+	if !same {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return false, fmt.Errorf("write credential to %s: %w", path, err)
+		}
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return false, fmt.Errorf("chmod credential at %s: %w", path, err)
+	}
+	return !same, nil
+}
+
+// taskLister is the subset of *client.Client that the in-flight check needs;
+// tests substitute a fake to simulate running tasks or an unreachable daemon.
+type taskLister interface {
+	Tasks() ([]store.Task, error)
+}
+
+// inFlightTaskIDs returns the IDs of non-terminal (Created or Running)
+// tasks, plus the raw error from Tasks() (nil on success). It does not
+// decide what an error means -- restartBlockReason does that, since
+// "daemon not listening at all" and "daemon up but not responding" call for
+// different handling.
+func inFlightTaskIDs(c taskLister) ([]string, error) {
+	tasks, err := c.Tasks()
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, t := range tasks {
+		if t.State == store.StateCreated || t.State == store.StateRunning {
+			ids = append(ids, t.ID)
+		}
+	}
+	return ids, nil
+}
+
+// daemonUnreachable reports whether err indicates nothing is listening on
+// the daemon socket at all: a dial failure (connection refused, or the
+// socket path doesn't exist -- both surface as a *net.OpError with
+// Op "dial"). Per issue #57's design note, that case has nothing running,
+// so a restart is safe. Any other error -- including a timeout, which can
+// mean the daemon accepted the connection but is hung -- is not treated as
+// safe.
+func daemonUnreachable(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
+// restartBlockReason returns why the self-service restart must not proceed
+// without --force, or "" if it may proceed. tasksErr is the error (if any)
+// from listing the daemon's tasks.
+func restartBlockReason(running []string, tasksErr error) string {
+	switch {
+	case tasksErr != nil && daemonUnreachable(tasksErr):
+		return "" // nothing listening at all: nothing running, safe
+	case tasksErr != nil:
+		return fmt.Sprintf("could not confirm the daemon has no in-flight tasks: %v", tasksErr)
+	case len(running) > 0:
+		return fmt.Sprintf("%d task(s) still running (%s)", len(running), strings.Join(running, ", "))
+	default:
+		return ""
+	}
+}
+
+// errRestartSkipped signals that creds set wrote the credential
+// successfully but declined to restart the daemon -- in-flight tasks, or an
+// inconclusive in-flight check, blocked it without --force. The credential
+// write is not a failure, so main() maps this to its own exit code rather
+// than the generic failure exit code.
+var errRestartSkipped = errors.New("restart skipped (see the message above); rerun with --force or restart manually")
+
+// maybeRestart implements the self-service restart from issue #57's design
+// note: it runs `systemctl restart agent-taskd` itself, as the operator's
+// own action, rather than only printing a reminder. It checks the daemon's
+// own task list first so it doesn't kill an in-flight task; if the check is
+// blocked or inconclusive, it warns and requires --force. UX choice: when
+// nothing is running it just restarts and informs the operator, with no
+// extra confirmation prompt -- running `creds set` is already the
+// operator's own explicit action. unitChanged controls whether it reloads
+// the unit first: `systemctl restart` alone does not reparse a unit file
+// that changed on disk, but a daemon-reload on every run (including a
+// no-op) would be unnecessary. If systemctl itself fails (no systemd, or no
+// permission -- expected in dev/test environments), it falls back to
+// printing the manual-restart reminder instead of erroring the command out:
+// the credential write already succeeded, which is the important part.
+func maybeRestart(socketPath string, unitChanged, force bool) error {
+	running, tasksErr := inFlightTaskIDs(client.New(socketPath))
+	if reason := restartBlockReason(running, tasksErr); reason != "" && !force {
+		fmt.Printf("%s; not restarting\n", reason)
+		fmt.Println("rerun with --force to restart anyway, or restart manually later: sudo systemctl restart agent-taskd")
+		return errRestartSkipped
+	}
+
+	if unitChanged {
+		if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+			fmt.Println("could not reload the systemd unit automatically; reload and restart manually for this change to take effect:")
+			fmt.Println("  sudo systemctl daemon-reload && sudo systemctl restart agent-taskd")
+			if msg := strings.TrimSpace(string(out)); msg != "" {
+				fmt.Printf("(systemctl said: %s)\n", msg)
+			}
+			return nil
+		}
+	}
+
+	if out, err := exec.Command("systemctl", "restart", "agent-taskd").CombinedOutput(); err != nil {
+		fmt.Println("could not restart agent-taskd automatically; restart it manually for this change to take effect:")
+		fmt.Println("  sudo systemctl restart agent-taskd")
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			fmt.Printf("(systemctl said: %s)\n", msg)
+		}
+		return nil
+	}
+
+	fmt.Println("restarted agent-taskd")
+	return nil
+}
+
+// runCredsList shows configured credential refs (names only, never values),
+// cross-referenced against the credentials directory and the systemd unit's
+// LoadCredential lines.
+func runCredsList(args []string) error {
+	fs := flag.NewFlagSet("creds list", flag.ExitOnError)
+	configPath := fs.String("config", defaultConfigPath, "path to config.yaml")
+	credentialsDir := fs.String("credentials-dir", defaultCredentialsDir, "directory credential files are written to")
+	unitPath := fs.String("unit-file", defaultUnitPath, "systemd unit file to check LoadCredential lines in")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+
+	unitData, err := os.ReadFile(*unitPath)
+	if err != nil {
+		return fmt.Errorf("read unit file %s: %w", *unitPath, err)
+	}
+	unitText := string(unitData)
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "REF\tSTATUS")
+	for _, ref := range configTokenRefs(cfg) {
+		fmt.Fprintf(tw, "%s\t%s\n", ref, credStatus(*credentialsDir, unitText, ref))
+	}
+	return tw.Flush()
+}
+
+// configTokenRefs collects every token_ref named in config.yaml's repos and
+// agents, deduplicated, repos first (in their config order) then agents
+// (sorted by name for deterministic output).
+func configTokenRefs(cfg *config.Config) []string {
+	seen := make(map[string]bool)
+	var refs []string
+	for _, r := range cfg.Repos {
+		if r.TokenRef != "" && !seen[r.TokenRef] {
+			seen[r.TokenRef] = true
+			refs = append(refs, r.TokenRef)
+		}
+	}
+	agentNames := make([]string, 0, len(cfg.Agents))
+	for name := range cfg.Agents {
+		agentNames = append(agentNames, name)
+	}
+	sort.Strings(agentNames)
+	for _, name := range agentNames {
+		ref := cfg.Agents[name].TokenRef
+		if ref != "" && !seen[ref] {
+			seen[ref] = true
+			refs = append(refs, ref)
+		}
+	}
+	return refs
+}
+
+// credStatus reports ref's wiring status: "ok" if both the credential file
+// and the unit's LoadCredential line exist, "missing file" if the file does
+// not, else "missing unit line".
+func credStatus(credentialsDir, unitText, ref string) string {
+	_, err := os.Stat(filepath.Join(credentialsDir, ref))
+	hasFile := err == nil
+	hasLine := unitfile.HasLine(unitText, ref)
+
+	switch {
+	case hasFile && hasLine:
+		return "ok"
+	case !hasFile:
+		return "missing file"
+	default:
+		return "missing unit line"
+	}
 }
 
 func runLs(args []string) error {
