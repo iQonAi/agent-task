@@ -1,6 +1,9 @@
 package github
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -58,5 +61,45 @@ func TestBuildPRBodyTestOutput(t *testing.T) {
 	body := BuildPRBody(PRInfo{TaskID: "t1", Agent: "claude", TestOutput: "ok 5 tests"})
 	if !strings.Contains(body, "## Test results") || !strings.Contains(body, "ok 5 tests") {
 		t.Errorf("test output not rendered:\n%s", body)
+	}
+}
+
+// ghStub is a fake `gh` binary installed on PATH, exiting with $STUB_EXIT
+// (0 = success). It ignores its arguments: CheckAccess's own call-shape
+// (gh api repos/{owner}/{repo}) is not under test here, only that its
+// result (success vs error) propagates.
+const ghStub = `#!/bin/sh
+exit "${STUB_EXIT:-0}"
+`
+
+// TestCheckAccess covers both outcomes of the underlying gh call: success
+// (no error) and failure (the raw gh error returned, unmodified -- it is
+// the caller's job, not this method's, to decide what a failure means).
+func TestCheckAccess(t *testing.T) {
+	cases := []struct {
+		name     string
+		stubExit string
+		wantErr  bool
+	}{
+		{name: "token can see the repo", stubExit: "0", wantErr: false},
+		{name: "gh reports an error (404 or otherwise)", stubExit: "1", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(ghStub), 0o755); err != nil {
+				t.Fatalf("write gh stub: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("STUB_EXIT", tc.stubExit)
+
+			err := New("o", "r", "tok").CheckAccess(context.Background())
+			if tc.wantErr && err == nil {
+				t.Fatal("CheckAccess() = nil, want an error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("CheckAccess() = %v, want nil", err)
+			}
+		})
 	}
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -617,5 +619,239 @@ func TestNoSecretLeakage(t *testing.T) {
 	}
 	if strings.Contains(string(unitData), secret) {
 		t.Fatalf("unit file contains the literal secret:\n%s", unitData)
+	}
+}
+
+// fakeAccessChecker is a stub repoAccessChecker for exercising
+// doctorCheckRepo's live-GitHub check without shelling out to gh.
+type fakeAccessChecker struct {
+	err error
+}
+
+func (f fakeAccessChecker) CheckAccess(ctx context.Context) error { return f.err }
+
+// doctorFixture sets up a credentials dir and unit file for doctorCheckRepo
+// tests, returning both paths. withCred/withUnitLine control whether the
+// repo's ref gets a credential file and an active LoadCredential line,
+// respectively, so each of the three checks can be exercised independently.
+func doctorFixture(t *testing.T, ref string, withCred, withUnitLine bool) (credentialsDir, unitText string) {
+	t.Helper()
+	credentialsDir = t.TempDir()
+	if withCred {
+		if err := os.WriteFile(filepath.Join(credentialsDir, ref), []byte("tok\n"), 0o600); err != nil {
+			t.Fatalf("write credential fixture: %v", err)
+		}
+	}
+	unitText = "[Service]\n"
+	if withUnitLine {
+		unitText += fmt.Sprintf("LoadCredential=%s:/etc/agent-task/credentials/%s\n", ref, ref)
+	}
+	return credentialsDir, unitText
+}
+
+// TestDoctorCheckRepo_AllPass covers the happy path: credential file present,
+// unit line present, and the (faked) GitHub check succeeds.
+func TestDoctorCheckRepo_AllPass(t *testing.T) {
+	credentialsDir, unitText := doctorFixture(t, "gh-token-a", true, true)
+	r := config.Repo{Name: "a", Owner: "o", Repo: "r", TokenRef: "gh-token-a"}
+
+	ok, lines := doctorCheckRepo(context.Background(), r, credentialsDir, unitText,
+		func(owner, repoName, token string) repoAccessChecker { return fakeAccessChecker{} })
+
+	if !ok {
+		t.Fatalf("allOK = false, want true:\n%s", strings.Join(lines, "\n"))
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "FAIL") {
+			t.Errorf("unexpected FAIL line: %s", line)
+		}
+	}
+}
+
+// TestDoctorCheckRepo_EachCheckFailsIndependently covers each of the three
+// checks failing on its own, with the other two passing, and that all three
+// are reported rather than short-circuited on the first failure.
+func TestDoctorCheckRepo_EachCheckFailsIndependently(t *testing.T) {
+	cases := []struct {
+		name         string
+		withCred     bool
+		withUnitLine bool
+		checkErr     error
+		wantFailSub  string
+		// wantFailCount is 2 only for the missing-credential-file case: that
+		// failure also skips (and so fails) the live-GitHub check, since
+		// there is no token to read. The other two cases fail exactly one
+		// check, leaving the other two passing.
+		wantFailCount int
+	}{
+		{name: "missing credential file", withCred: false, withUnitLine: true, wantFailSub: "credential file missing", wantFailCount: 2},
+		{name: "missing unit line", withCred: true, withUnitLine: false, wantFailSub: "missing a LoadCredential line", wantFailCount: 1},
+		{name: "github access fails", withCred: true, withUnitLine: true, checkErr: errors.New("gh: Not Found (HTTP 404)"), wantFailSub: "live GitHub access", wantFailCount: 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			credentialsDir, unitText := doctorFixture(t, "gh-token-a", tc.withCred, tc.withUnitLine)
+			r := config.Repo{Name: "a", Owner: "o", Repo: "r", TokenRef: "gh-token-a"}
+
+			ok, lines := doctorCheckRepo(context.Background(), r, credentialsDir, unitText,
+				func(owner, repoName, token string) repoAccessChecker { return fakeAccessChecker{err: tc.checkErr} })
+
+			if ok {
+				t.Fatalf("allOK = true, want false:\n%s", strings.Join(lines, "\n"))
+			}
+			found := false
+			for _, line := range lines {
+				if strings.Contains(line, "FAIL") && strings.Contains(line, tc.wantFailSub) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no FAIL line containing %q:\n%s", tc.wantFailSub, strings.Join(lines, "\n"))
+			}
+			failCount := 0
+			for _, line := range lines {
+				if strings.Contains(line, "FAIL") {
+					failCount++
+				}
+			}
+			if failCount != tc.wantFailCount {
+				t.Fatalf("got %d FAIL lines, want %d:\n%s", failCount, tc.wantFailCount, strings.Join(lines, "\n"))
+			}
+		})
+	}
+}
+
+// TestDoctorCheckRepo_GitHubFailureDoesNotClaimFalseCertainty covers the
+// pending-token-vs-wrong-name distinction: gh surfaces the same 404 for a
+// genuinely wrong/renamed repo and for a fine-grained token still pending
+// org-owner approval, so the failure message must name both possibilities
+// rather than asserting either one is the cause.
+func TestDoctorCheckRepo_GitHubFailureDoesNotClaimFalseCertainty(t *testing.T) {
+	credentialsDir, unitText := doctorFixture(t, "gh-token-a", true, true)
+	r := config.Repo{Name: "a", Owner: "o", Repo: "r", TokenRef: "gh-token-a"}
+
+	_, lines := doctorCheckRepo(context.Background(), r, credentialsDir, unitText,
+		func(owner, repoName, token string) repoAccessChecker {
+			return fakeAccessChecker{err: errors.New("gh: Not Found (HTTP 404)")}
+		})
+
+	var ghLine string
+	for _, line := range lines {
+		if strings.Contains(line, "live GitHub access") {
+			ghLine = line
+		}
+	}
+	if ghLine == "" {
+		t.Fatalf("no live GitHub access line found:\n%s", strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(ghLine, "wrong") || !strings.Contains(ghLine, "pending") {
+		t.Fatalf("message does not name both possibilities (wrong name / pending approval):\n%s", ghLine)
+	}
+	if strings.Contains(ghLine, "renamed repo:") || strings.Contains(ghLine, "pending approval:") {
+		t.Fatalf("message appears to assert a definite cause rather than naming both possibilities:\n%s", ghLine)
+	}
+}
+
+// TestRunReposDoctor_UnknownNameErrorsCleanly covers `repos doctor <name>`
+// for a name not present in the registry.
+func TestRunReposDoctor_UnknownNameErrorsCleanly(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	const content = "repos:\n  - {name: a, owner: o, repo: r, token_ref: gh-token-a}\n"
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	err := runReposDoctor([]string{
+		"--config", configPath,
+		"--credentials-dir", t.TempDir(),
+		"--unit-file", writeUnitFixture(t),
+		"no-such-repo",
+	})
+	if err == nil {
+		t.Fatal("runReposDoctor(unknown name) = nil, want an error")
+	}
+}
+
+// TestRunReposDoctor_ExitNonZeroWhenAnyRepoFails covers the scriptable exit
+// code contract across multiple repos: a config with repos that have no
+// credential file (so the check fails without ever reaching the live-GitHub
+// check, which this test cannot fake since runReposDoctor always
+// constructs a real github.Client) must make the command return an error.
+func TestRunReposDoctor_ExitNonZeroWhenAnyRepoFails(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	const content = "repos:\n" +
+		"  - {name: a, owner: o, repo: r1, token_ref: gh-token-a}\n" +
+		"  - {name: b, owner: o, repo: r2, token_ref: gh-token-b}\n"
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	out := withCapturedStdout(t, func() {
+		err := runReposDoctor([]string{
+			"--config", configPath,
+			"--credentials-dir", t.TempDir(), // neither ref has a credential file
+			"--unit-file", writeUnitFixture(t),
+		})
+		if err == nil {
+			t.Fatal("runReposDoctor() = nil, want an error when a repo's checks fail")
+		}
+	})
+	if !strings.Contains(out, "FAIL") {
+		t.Fatalf("output has no FAIL line:\n%s", out)
+	}
+}
+
+// doctorGhStub is a fake `gh` binary installed on PATH for
+// TestRunReposDoctor_ExitZeroWhenAllPass, exiting with $STUB_EXIT (0 =
+// success) -- the same mechanics as internal/github/github_test.go's
+// ghStub/TestCheckAccess, reused here so the full CLI path (which
+// constructs a real github.Client) never makes a real network call.
+const doctorGhStub = `#!/bin/sh
+exit "${STUB_EXIT:-0}"
+`
+
+// TestRunReposDoctor_ExitZeroWhenAllPass covers the full CLI path's
+// exit-code-0 behavior end to end: a repo whose credential file exists,
+// whose unit has the LoadCredential line, and whose `gh api` call succeeds
+// (via the stub) must make runReposDoctor return nil.
+func TestRunReposDoctor_ExitZeroWhenAllPass(t *testing.T) {
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(doctorGhStub), 0o755); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("STUB_EXIT", "0")
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	const content = "repos:\n  - {name: a, owner: o, repo: r, token_ref: gh-token-a}\n"
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	credentialsDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(credentialsDir, "gh-token-a"), []byte("tok\n"), 0o600); err != nil {
+		t.Fatalf("write credential fixture: %v", err)
+	}
+
+	unitPath := filepath.Join(t.TempDir(), "agent-taskd.service")
+	const unitContent = "LoadCredential=gh-token-a:/etc/agent-task/credentials/gh-token-a\n"
+	if err := os.WriteFile(unitPath, []byte(unitContent), 0o644); err != nil {
+		t.Fatalf("write unit file: %v", err)
+	}
+
+	var err error
+	out := withCapturedStdout(t, func() {
+		err = runReposDoctor([]string{
+			"--config", configPath,
+			"--credentials-dir", credentialsDir,
+			"--unit-file", unitPath,
+		})
+	})
+	if err != nil {
+		t.Fatalf("runReposDoctor() = %v, want nil:\n%s", err, out)
+	}
+	if strings.Contains(out, "FAIL") {
+		t.Fatalf("output has a FAIL line despite all checks passing:\n%s", out)
 	}
 }
