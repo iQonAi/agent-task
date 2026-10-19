@@ -27,6 +27,7 @@ import (
 	"github.com/iQonAi/agent-task/internal/controller"
 	"github.com/iQonAi/agent-task/internal/creds"
 	"github.com/iQonAi/agent-task/internal/daemon"
+	"github.com/iQonAi/agent-task/internal/github"
 	"github.com/iQonAi/agent-task/internal/prompt"
 	"github.com/iQonAi/agent-task/internal/repo"
 	"github.com/iQonAi/agent-task/internal/runner"
@@ -98,6 +99,7 @@ usage:
 	agent-task repos [list] [--socket PATH]	list registered repositories
 	agent-task repos add (--url URL | --owner O --repo R) --name NAME [--default-branch B] [--token-ref REF] [--dry-run]	register a repo in config.yaml
 	agent-task repos remove NAME [--yes]	remove a repo from config.yaml
+	agent-task repos doctor [NAME]	check credential file, unit wiring, and live GitHub access per repo
 	agent-task creds set REF [--from-file PATH] [--force]	write a credential and wire it into the systemd unit
 	agent-task creds list [--config PATH]	show configured credential refs and their status
 	agent-task ls [--socket PATH]	list tasks
@@ -441,11 +443,13 @@ func runRepos(args []string) error {
 		return runReposAdd(args[1:])
 	case "remove":
 		return runReposRemove(args[1:])
+	case "doctor":
+		return runReposDoctor(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			return runReposList(args)
 		}
-		return fmt.Errorf("unknown repos subcommand %q (want list|add|remove)", args[0])
+		return fmt.Errorf("unknown repos subcommand %q (want list|add|remove|doctor)", args[0])
 	}
 }
 
@@ -585,6 +589,137 @@ func runReposRemove(args []string) error {
 	fmt.Println("this does not touch credential files or the systemd unit")
 	fmt.Println("restart the daemon for this change to take effect")
 	return nil
+}
+
+// repoAccessChecker is the subset of *github.Client that repos doctor's
+// live-GitHub check needs; tests substitute a fake so the check never
+// shells out to gh.
+type repoAccessChecker interface {
+	CheckAccess(ctx context.Context) error
+}
+
+// runReposDoctor validates each registered repo's (or, with a name, just
+// that one's) credential file, systemd unit wiring, and live GitHub access.
+// It is a one-shot CLI diagnostic, not a daemon RPC: it reads config.yaml,
+// the credentials directory, and the installed unit file directly.
+func runReposDoctor(args []string) error {
+	fs := flag.NewFlagSet("repos doctor", flag.ExitOnError)
+	configPath := fs.String("config", defaultConfigPath, "path to config.yaml")
+	credentialsDir := fs.String("credentials-dir", defaultCredentialsDir, "directory credential files are written to")
+	unitPath := fs.String("unit-file", defaultUnitPath, "systemd unit file to check LoadCredential lines in")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 1 {
+		return fmt.Errorf("usage: agent-task repos doctor [name]")
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+
+	repos := cfg.Repos
+	if fs.NArg() == 1 {
+		name := fs.Arg(0)
+		var found *config.Repo
+		for i := range cfg.Repos {
+			if cfg.Repos[i].Name == name {
+				found = &cfg.Repos[i]
+				break
+			}
+		}
+		if found == nil {
+			return fmt.Errorf("repo %q is not in the registry", name)
+		}
+		repos = []config.Repo{*found}
+	}
+
+	unitData, err := os.ReadFile(*unitPath)
+	if err != nil {
+		return fmt.Errorf("read unit file %s: %w", *unitPath, err)
+	}
+	unitText := string(unitData)
+
+	ctx := context.Background()
+	newChecker := func(owner, repoName, token string) repoAccessChecker {
+		return github.New(owner, repoName, token)
+	}
+
+	allOK := true
+	for _, r := range repos {
+		ok, lines := doctorCheckRepo(ctx, r, *credentialsDir, unitText, newChecker)
+		fmt.Printf("%s (%s/%s):\n", r.Name, r.Owner, r.Repo)
+		for _, line := range lines {
+			fmt.Println(line)
+		}
+		if !ok {
+			allOK = false
+		}
+	}
+
+	if !allOK {
+		return fmt.Errorf("repos doctor: one or more checks failed")
+	}
+	return nil
+}
+
+// doctorCheckRepo runs the three independent checks for one repo --
+// credential file presence, systemd unit LoadCredential line, live GitHub
+// access -- and reports all three regardless of earlier failures (except
+// that the GitHub check is skipped, and counted as failed, when there is no
+// credential file to read a token from). newChecker builds the live-GitHub
+// checker from the repo's owner/repo/token; production passes a
+// github.New-backed constructor, tests substitute a fake so nothing here
+// shells out to gh.
+func doctorCheckRepo(ctx context.Context, r config.Repo, credentialsDir, unitText string, newChecker func(owner, repoName, token string) repoAccessChecker) (allOK bool, lines []string) {
+	allOK = true
+
+	credPath := filepath.Join(credentialsDir, r.TokenRef)
+	_, statErr := os.Stat(credPath)
+	credOK := statErr == nil
+	if credOK {
+		lines = append(lines, fmt.Sprintf("  [ok]   credential file exists: %s", credPath))
+	} else {
+		allOK = false
+		lines = append(lines, fmt.Sprintf(
+			"  [FAIL] credential file missing: %s — fix: agent-task creds set %s", credPath, r.TokenRef))
+	}
+
+	if unitfile.HasLine(unitText, r.TokenRef) {
+		lines = append(lines, fmt.Sprintf("  [ok]   systemd unit has a LoadCredential line for %q", r.TokenRef))
+	} else {
+		allOK = false
+		lines = append(lines, fmt.Sprintf(
+			"  [FAIL] systemd unit missing a LoadCredential line for %q — fix: agent-task creds set %s",
+			r.TokenRef, r.TokenRef))
+	}
+
+	if !credOK {
+		allOK = false
+		lines = append(lines, fmt.Sprintf(
+			"  [FAIL] live GitHub access: skipped, no credential file to read a token from — fix: agent-task creds set %s", r.TokenRef))
+		return allOK, lines
+	}
+
+	data, err := os.ReadFile(credPath)
+	if err != nil {
+		allOK = false
+		lines = append(lines, fmt.Sprintf("  [FAIL] live GitHub access: could not read credential file %s: %v", credPath, err))
+		return allOK, lines
+	}
+	token := strings.TrimSpace(string(data))
+
+	checker := newChecker(r.Owner, r.Repo, token)
+	if err := checker.CheckAccess(ctx); err != nil {
+		allOK = false
+		lines = append(lines, fmt.Sprintf(
+			"  [FAIL] live GitHub access to %s/%s: %v — repo unreachable with this token: could be a wrong/renamed repo OR a token pending org-owner approval; see docs/runbook/0001-agent-task-vm.md's pending-approval note, and verify the repo name/owner in config.yaml",
+			r.Owner, r.Repo, err))
+	} else {
+		lines = append(lines, fmt.Sprintf("  [ok]   live GitHub access to %s/%s", r.Owner, r.Repo))
+	}
+	return allOK, lines
 }
 
 // confirm prompts the user on stdin for a y/n answer.

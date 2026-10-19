@@ -156,3 +156,15 @@ func (c *Client) CommentIssue(ctx context.Context, number int, body string) erro
 	_, err := c.gh(ctx, "", "issue", "comment", strconv.Itoa(number), "--repo", c.slug(), "--body", body)
 	return err
 }
+
+// CheckAccess verifies the client's token can see owner/repo (used by
+// `repos doctor`). It returns gh's raw error on failure. GitHub returns the
+// same 404 whether the repo genuinely doesn't exist/was renamed or a
+// fine-grained token simply hasn't been approved by the org owner yet
+// (docs/runbook/0001-agent-task-vm.md's "Gotcha" note) -- the two are not
+// distinguishable from this response alone, so this method does not attempt
+// to tell them apart; that is left to the caller's message.
+func (c *Client) CheckAccess(ctx context.Context) error {
+	_, err := c.gh(ctx, "", "api", "repos/"+c.slug())
+	return err
+}
