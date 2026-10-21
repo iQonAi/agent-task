@@ -1,6 +1,7 @@
 package unitfile
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,6 +130,127 @@ func TestHasLine(t *testing.T) {
 				t.Errorf("HasLine(fixture, %q) = %v, want %v", tc.ref, got, tc.want)
 			}
 		})
+	}
+}
+
+func fakeSystemctlShow(t *testing.T, fn func(unitName string) ([]byte, error)) {
+	t.Helper()
+	orig := systemctlShow
+	systemctlShow = fn
+	t.Cleanup(func() { systemctlShow = orig })
+}
+
+func TestEffectiveText_IncludesDropInContent(t *testing.T) {
+	path := write(t, fixture)
+
+	dropInPath := filepath.Join(t.TempDir(), "override.conf")
+	dropInContent := "[Service]\nLoadCredential=claude-oauth-token:/etc/agent-task/credentials/claude-oauth-token\n"
+	if err := os.WriteFile(dropInPath, []byte(dropInContent), 0o644); err != nil {
+		t.Fatalf("write drop-in: %v", err)
+	}
+
+	fakeSystemctlShow(t, func(unitName string) ([]byte, error) {
+		if unitName != "test-unit.service" {
+			t.Fatalf("unitName = %q, want %q", unitName, "test-unit.service")
+		}
+		return []byte("DropInPaths=" + dropInPath + "\n"), nil
+	})
+
+	unitPath := filepath.Join(filepath.Dir(path), "test-unit.service")
+	if err := os.WriteFile(unitPath, []byte(fixture), 0o644); err != nil {
+		t.Fatalf("write unit fixture: %v", err)
+	}
+
+	effective, err := EffectiveText(unitPath)
+	if err != nil {
+		t.Fatalf("EffectiveText: %v", err)
+	}
+	if !HasLine(effective, "claude-oauth-token") {
+		t.Fatalf("drop-in LoadCredential line not found in effective text:\n%s", effective)
+	}
+}
+
+func TestEffectiveText_FallsBackToLiteralOnSystemctlError(t *testing.T) {
+	path := write(t, fixture)
+
+	fakeSystemctlShow(t, func(unitName string) ([]byte, error) {
+		return nil, fmt.Errorf("systemctl not found")
+	})
+
+	effective, err := EffectiveText(path)
+	if err != nil {
+		t.Fatalf("EffectiveText: %v", err)
+	}
+	if effective != fixture {
+		t.Fatalf("EffectiveText = %q, want unchanged literal content %q", effective, fixture)
+	}
+}
+
+func TestEnsureLoadCredential_NoDuplicateWhenLineExistsOnlyInDropIn(t *testing.T) {
+	dir := t.TempDir()
+	unitPath := filepath.Join(dir, "test-unit.service")
+	if err := os.WriteFile(unitPath, []byte(fixture), 0o644); err != nil {
+		t.Fatalf("write unit fixture: %v", err)
+	}
+
+	dropInPath := filepath.Join(dir, "override.conf")
+	dropInContent := "LoadCredential=claude-oauth-token:/etc/agent-task/credentials/claude-oauth-token\n"
+	if err := os.WriteFile(dropInPath, []byte(dropInContent), 0o644); err != nil {
+		t.Fatalf("write drop-in: %v", err)
+	}
+
+	fakeSystemctlShow(t, func(unitName string) ([]byte, error) {
+		return []byte("DropInPaths=" + dropInPath + "\n"), nil
+	})
+
+	before := read(t, unitPath)
+
+	changed, err := EnsureLoadCredential(unitPath, "claude-oauth-token", "/etc/agent-task/credentials/claude-oauth-token")
+	if err != nil {
+		t.Fatalf("EnsureLoadCredential: %v", err)
+	}
+	if changed {
+		t.Fatal("changed = true, want false — line already present via drop-in")
+	}
+
+	after := read(t, unitPath)
+	if after != before {
+		t.Fatalf("literal unit file was modified:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// TestDropInText_SeparatesFilesLackingTrailingNewline guards against
+// concatenating drop-in files with no separator: a non-last file missing a
+// trailing newline must not glue its last line onto the next file's first
+// line, or a LoadCredential= line in a later file silently stops matching
+// HasLine's prefix check.
+func TestDropInText_SeparatesFilesLackingTrailingNewline(t *testing.T) {
+	dir := t.TempDir()
+	unitPath := filepath.Join(dir, "test-unit.service")
+	if err := os.WriteFile(unitPath, []byte(fixture), 0o644); err != nil {
+		t.Fatalf("write unit fixture: %v", err)
+	}
+
+	firstPath := filepath.Join(dir, "10-first.conf")
+	if err := os.WriteFile(firstPath, []byte("FOO=bar"), 0o644); err != nil { // no trailing newline
+		t.Fatalf("write first drop-in: %v", err)
+	}
+	secondPath := filepath.Join(dir, "20-second.conf")
+	secondContent := "LoadCredential=claude-oauth-token:/etc/agent-task/credentials/claude-oauth-token\n"
+	if err := os.WriteFile(secondPath, []byte(secondContent), 0o644); err != nil {
+		t.Fatalf("write second drop-in: %v", err)
+	}
+
+	fakeSystemctlShow(t, func(unitName string) ([]byte, error) {
+		return []byte("DropInPaths=" + firstPath + " " + secondPath + "\n"), nil
+	})
+
+	effective, err := EffectiveText(unitPath)
+	if err != nil {
+		t.Fatalf("EffectiveText: %v", err)
+	}
+	if !HasLine(effective, "claude-oauth-token") {
+		t.Fatalf("drop-in LoadCredential line not found (files glued together?):\n%s", effective)
 	}
 }
 
