@@ -219,6 +219,41 @@ func TestEnsureLoadCredential_NoDuplicateWhenLineExistsOnlyInDropIn(t *testing.T
 	}
 }
 
+// TestDropInText_SeparatesFilesLackingTrailingNewline guards against
+// concatenating drop-in files with no separator: a non-last file missing a
+// trailing newline must not glue its last line onto the next file's first
+// line, or a LoadCredential= line in a later file silently stops matching
+// HasLine's prefix check.
+func TestDropInText_SeparatesFilesLackingTrailingNewline(t *testing.T) {
+	dir := t.TempDir()
+	unitPath := filepath.Join(dir, "test-unit.service")
+	if err := os.WriteFile(unitPath, []byte(fixture), 0o644); err != nil {
+		t.Fatalf("write unit fixture: %v", err)
+	}
+
+	firstPath := filepath.Join(dir, "10-first.conf")
+	if err := os.WriteFile(firstPath, []byte("FOO=bar"), 0o644); err != nil { // no trailing newline
+		t.Fatalf("write first drop-in: %v", err)
+	}
+	secondPath := filepath.Join(dir, "20-second.conf")
+	secondContent := "LoadCredential=claude-oauth-token:/etc/agent-task/credentials/claude-oauth-token\n"
+	if err := os.WriteFile(secondPath, []byte(secondContent), 0o644); err != nil {
+		t.Fatalf("write second drop-in: %v", err)
+	}
+
+	fakeSystemctlShow(t, func(unitName string) ([]byte, error) {
+		return []byte("DropInPaths=" + firstPath + " " + secondPath + "\n"), nil
+	})
+
+	effective, err := EffectiveText(unitPath)
+	if err != nil {
+		t.Fatalf("EffectiveText: %v", err)
+	}
+	if !HasLine(effective, "claude-oauth-token") {
+		t.Fatalf("drop-in LoadCredential line not found (files glued together?):\n%s", effective)
+	}
+}
+
 func containsLine(text, line string) bool {
 	for _, l := range strings.Split(text, "\n") {
 		if l == line {

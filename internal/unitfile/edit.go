@@ -56,6 +56,9 @@ func DropInText(unitPath string) string {
 			return ""
 		}
 		sb.Write(data)
+		if len(data) > 0 && data[len(data)-1] != '\n' {
+			sb.WriteByte('\n')
+		}
 	}
 	return sb.String()
 }
