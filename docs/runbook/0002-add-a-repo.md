@@ -138,10 +138,18 @@ sudo chmod 0600 /etc/agent-task/credentials/gh-token-<repo>
 
 The daemon reads secrets **only** from `$CREDENTIALS_DIRECTORY`, which systemd
 populates from `LoadCredential=` lines. The file from step 2 does nothing
-until the unit delivers it. Add one line per repo, either editing the
-installed unit (keep `deploy/systemd/agent-taskd.service` in the repo in sync
-— it is the source of truth) or via a drop-in (`sudo systemctl edit
-agent-taskd`, under `[Service]`):
+until the unit delivers it. Add one line per repo to the installed unit file
+(keep `deploy/systemd/agent-taskd.service` in the repo in sync — it is the
+source of truth):
+
+> **Edit the installed unit file directly, not a `systemctl edit` drop-in.**
+> `agent-task repos doctor` and `agent-task creds set` both read the literal
+> `--unit-file` path (default: the installed unit) for the `LoadCredential=`
+> line — never systemd's merged drop-in view. A line added only via a
+> drop-in makes the daemon work but leaves `repos doctor` reporting
+> `[FAIL] systemd unit missing a LoadCredential line` forever, and its
+> suggested fix (`creds set <ref>`) would then add a duplicate line to the
+> main unit instead of fixing the mismatch.
 
 ```ini
 LoadCredential=gh-token-<repo>:/etc/agent-task/credentials/gh-token-<repo>
