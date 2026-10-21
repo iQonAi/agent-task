@@ -635,11 +635,10 @@ func runReposDoctor(args []string) error {
 		repos = []config.Repo{*found}
 	}
 
-	unitData, err := os.ReadFile(*unitPath)
+	unitText, err := unitfile.EffectiveText(*unitPath)
 	if err != nil {
 		return fmt.Errorf("read unit file %s: %w", *unitPath, err)
 	}
-	unitText := string(unitData)
 
 	ctx := context.Background()
 	newChecker := func(owner, repoName, token string) repoAccessChecker {
@@ -971,11 +970,10 @@ func runCredsList(args []string) error {
 		return err
 	}
 
-	unitData, err := os.ReadFile(*unitPath)
+	unitText, err := unitfile.EffectiveText(*unitPath)
 	if err != nil {
 		return fmt.Errorf("read unit file %s: %w", *unitPath, err)
 	}
-	unitText := string(unitData)
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "REF\tSTATUS")
