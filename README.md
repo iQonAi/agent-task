@@ -218,4 +218,5 @@ codebase is built against.
 - `TECHNICAL_DESIGN.md` — architecture, decisions, and milestones
 - `docs/project/` — vision, system architecture, and the security/threat model
 - `docs/runbook/0001-agent-task-vm.md` — operator runbook for provisioning a host
+- `docs/runbook/0002-add-a-repo.md` — how to add a repository and its credentials
 - `images/README.md` — agent base image contents and build/update process
