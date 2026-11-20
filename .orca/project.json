@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "name": "agent-task",
+  "tracker": "linear",
+  "github": {
+    "repo": "iQonAi/agent-task"
+  },
+  "linear": {
+    "team": "IQONAI",
+    "project": "agent-task"
+  }
+}
