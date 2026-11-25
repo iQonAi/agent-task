@@ -4,8 +4,10 @@ package repo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/iQonAi/agent-task/internal/gitx"
@@ -19,6 +21,17 @@ const tokenEnvVar = "AGENT_TASK_GIT_TOKEN"
 // credentialHelper is a one-shot shell function git runs when a remote asks for
 // authentication. Github accepts any username when the password is a PAT.
 const credentialHelper = `!f() { echo username=x-access-token; echo password=$` + tokenEnvVar + `; }; f`
+
+// upstreamRefspec keeps upstream branches under refs/remotes/origin/, apart from
+// the task branches that AddWorktree creates under refs/heads/. A fetch --prune
+// then only removes refs that came from upstream, never a running task's
+// branch (issue #71).
+const upstreamRefspec = "+refs/heads/*:refs/remotes/origin/*"
+
+// UpstreamRef is the mirror's copy of an upstream branch.
+func UpstreamRef(branch string) string {
+	return "refs/remotes/origin/" + branch
+}
 
 // Manager owns the host-side layout under data_dir
 type Manager struct {
@@ -61,8 +74,15 @@ func (m *Manager) Sync(ctx context.Context, name, url, token string) (string, er
 		return path, nil
 	}
 
+	// Rewrite an old-layout mirror before it fetches: its +refs/*:refs/*
+	// refspec would prune the task branches.
+	if err := migrate(ctx, path); err != nil {
+		return "", fmt.Errorf("migrate mirror %s: %w", name, err)
+	}
+
 	// --prune drops refs who upstream branch was deleted, so the cache does
-	// not acccumulate every branch the repo has ever had.
+	// not acccumulate every branch the repo has ever had. It only touches
+	// refs/remotes/origin/, so task branches survive.
 	if _, err := gitx.RunEnv(ctx, path, env, gitArgs(authArgs, "fetch", "--prune", "--quiet")...); err != nil {
 		return "", fmt.Errorf("fetch mirror %s: %w", name, err)
 	}
@@ -82,13 +102,54 @@ func (m *Manager) clone(ctx context.Context, path, url string, authArgs, env []s
 		return fmt.Errorf("clear partial mirror: %w", err)
 	}
 
-	if _, err := gitx.RunEnv(ctx, parent, env, gitArgs(authArgs, "clone", "--mirror", "--quiet", url, tmp)...); err != nil {
+	// A bare repo with a normal origin remote, not clone --mirror: remote add
+	// sets upstreamRefspec, so upstream branches land in refs/remotes/origin/
+	// and refs/heads/ holds only task branches.
+	if _, err := gitx.Run(ctx, parent, "init", "--bare", "--quiet", tmp); err != nil {
+		os.RemoveAll(tmp)
+		return fmt.Errorf("init mirror: %w", err)
+	}
+	if _, err := gitx.Run(ctx, tmp, "remote", "add", "origin", url); err != nil {
+		os.RemoveAll(tmp)
+		return fmt.Errorf("add mirror remote: %w", err)
+	}
+	if _, err := gitx.RunEnv(ctx, tmp, env, gitArgs(authArgs, "fetch", "--quiet", "origin")...); err != nil {
 		os.RemoveAll(tmp)
 		return fmt.Errorf("clone mirror: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.RemoveAll(tmp)
 		return fmt.Errorf("publish mirror: %w", err)
+	}
+	return nil
+}
+
+// migrate moves a mirror made by `clone --mirror` to the upstreamRefspec
+// layout. It only rewrites config, so it never deletes a ref; the old upstream
+// copies in refs/heads/ stay behind, unused. Idempotent: each step is safe to
+// repeat, and the refspec is written last, so an interrupted run is redone.
+func migrate(ctx context.Context, path string) error {
+	fetch, err := gitx.Run(ctx, path, "config", "--get-all", "remote.origin.fetch")
+	if err != nil {
+		return fmt.Errorf("read refspec: %w", err)
+	}
+	if fetch == upstreamRefspec {
+		return nil
+	}
+	// mirror=true makes a plain `git push origin` push every ref.
+	if _, err := gitx.Run(ctx, path, "config", "remote.origin.mirror", "false"); err != nil {
+		return fmt.Errorf("clear mirror flag: %w", err)
+	}
+	// clone --mirror sets tagOpt=--no-tags; a new mirror follows tags.
+	// Exit status 5 means the key is already absent.
+	if _, err := gitx.Run(ctx, path, "config", "--unset-all", "remote.origin.tagOpt"); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 5 {
+			return fmt.Errorf("clear tagOpt: %w", err)
+		}
+	}
+	if _, err := gitx.Run(ctx, path, "config", "--replace-all", "remote.origin.fetch", upstreamRefspec); err != nil {
+		return fmt.Errorf("set refspec: %w", err)
 	}
 	return nil
 }

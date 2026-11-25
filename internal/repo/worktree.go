@@ -22,8 +22,8 @@ func (m *Manager) WorktreePath(taskID string) string {
 	return filepath.Join(m.dataDir, "worktrees", taskID)
 }
 
-// AddWorktree creates a worktree at a fresh branch off the mirror's default
-// branch. mirrorPath must be an existing bare mirror (from Sync).
+// AddWorktree creates a worktree at a fresh branch off the mirror's upstream
+// copy of the default branch. mirrorPath must be an existing mirror (from Sync).
 func (m *Manager) AddWorktree(ctx context.Context, mirrorPath, taskID, branch, defaultBranch string) (*Worktree, error) {
 	path := m.WorktreePath(taskID)
 
@@ -33,10 +33,11 @@ func (m *Manager) AddWorktree(ctx context.Context, mirrorPath, taskID, branch, d
 
 	// git worktree add -b <branch> <path> <start-point>. Run from inside the
 	// mirror so git knows which repository owns the worktree. The start point
-	// is the mirror's copy of the default branch, not a remote lookup.
+	// is the mirror's upstream copy of the default branch, not a remote lookup.
+	// --no-track: the task branch has no upstream to follow.
 	if _, err := gitx.Run(
 		ctx, mirrorPath,
-		"worktree", "add", "-b", branch, path, "refs/heads/"+defaultBranch,
+		"worktree", "add", "--no-track", "-b", branch, path, UpstreamRef(defaultBranch),
 	); err != nil {
 		return nil, fmt.Errorf("add worktree for %s : %w", taskID, err)
 	}
