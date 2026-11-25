@@ -9,16 +9,18 @@ import (
 	"github.com/iQonAi/agent-task/internal/gitx"
 )
 
-// BuildExport creates a self-contained copy of srcRepo's upstream branch into
-// destDir: a standalone git repo with its own object store and NO reference
-// back to srcRepo. This is the copy handed to the container (§8.4). srcRepo is
-// a mirror from Sync, so the branch lives at UpstreamRef(branch); clone
-// --branch only sees refs/heads/, so the export is built with init + fetch.
-// A fetch from a local path sends a pack, so the container shares no inodes
-// with the host mirror. Only the one branch (and tags in its history) is
-// fetched, and no remote is configured, so there is no URL for a hostile agent
-// to fetch from or push to.
-func (m *Manager) BuildExport(ctx context.Context, srcRepo, branch, destDir string) error {
+// BuildExport creates a self-contained copy of the task branch taskBranch in
+// srcRepo into destDir, checked out under the name branch (the default
+// branch): a standalone git repo with its own object store and NO reference
+// back to srcRepo. This is the copy handed to the container (§8.4). It copies
+// the task branch, not the upstream ref, because AddWorktree fixed the task
+// branch at the base: another task's Sync can move the upstream ref, but the
+// export base still equals the worktree base. clone --branch cannot rename the
+// branch, so the export is built with init + fetch. A fetch from a local path
+// sends a pack, so the container shares no inodes with the host mirror. Only
+// the one branch (and tags in its history) is fetched, and no remote is
+// configured, so there is no URL for a hostile agent to fetch from or push to.
+func (m *Manager) BuildExport(ctx context.Context, srcRepo, taskBranch, branch, destDir string) error {
 	if err := os.MkdirAll(filepath.Dir(destDir), 0o755); err != nil {
 		return fmt.Errorf("create export parent: %w", err)
 	}
@@ -27,7 +29,7 @@ func (m *Manager) BuildExport(ctx context.Context, srcRepo, branch, destDir stri
 	}
 	// --update-head-ok: HEAD already names the (unborn) branch being fetched.
 	if _, err := gitx.Run(ctx, destDir,
-		"fetch", "--quiet", "--update-head-ok", srcRepo, UpstreamRef(branch)+":refs/heads/"+branch,
+		"fetch", "--quiet", "--update-head-ok", srcRepo, "refs/heads/"+taskBranch+":refs/heads/"+branch,
 	); err != nil {
 		return fmt.Errorf("build export of %s@%s: %w", srcRepo, branch, err)
 	}

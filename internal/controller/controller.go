@@ -222,7 +222,7 @@ func Run(ctx context.Context, deps Deps, req Request) (out Outcome, err error) {
 	// 3. Build the standalone source export handed to the container.
 	exportDir := filepath.Join(req.WorkDir, "export")
 	deps.event(req.TaskID, store.EventPhase, "build export")
-	if err := deps.Repo.BuildExport(ctx, mirror, req.DefaultBranch, exportDir); err != nil {
+	if err := deps.Repo.BuildExport(ctx, mirror, wt.Branch, req.DefaultBranch, exportDir); err != nil {
 		return Outcome{}, err
 	}
 	base, err := deps.Repo.ExportBase(ctx, exportDir)
